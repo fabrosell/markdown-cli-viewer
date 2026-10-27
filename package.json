@@ -1,0 +1,38 @@
+{
+  "name": "markdown-cli-viewer",
+  "version": "1.0.0",
+  "description": "Render a Markdown file in the terminal in a human-readable way: wrapped text, styled bold/italic/code, and vertically-aligned tables.",
+  "type": "module",
+  "bin": {
+    "mdview": "dist/mdview.cjs"
+  },
+  "main": "src/renderer.js",
+  "scripts": {
+    "build": "esbuild src/cli.js --bundle --platform=node --format=cjs --target=node18 --outfile=dist/mdview.cjs",
+    "prepublishOnly": "npm run build",
+    "start": "node dist/mdview.cjs",
+    "demo": "node dist/mdview.cjs sample.md",
+    "dev": "node src/cli.js"
+  },
+  "keywords": [
+    "markdown",
+    "cli",
+    "terminal",
+    "viewer",
+    "ansi",
+    "render"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.6.2",
+    "cli-table3": "^0.6.5",
+    "marked": "^15.0.12",
+    "marked-terminal": "^7.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}
