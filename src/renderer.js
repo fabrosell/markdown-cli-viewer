@@ -306,29 +306,80 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
     return color ? c.gray(`${n} │ `) : `${n} │ `;
   };
 
+  const countNewlines = (s) => (String(s).match(/\n/g) || []).length;
+
+  // Render one token's raw source to its visible lines (blank top/bottom
+  // trimmed). Returns [] if the token produces no output.
+  const renderBlockLines = (tok) => {
+    const rendered = marked.parse(tok.raw, { async: false });
+    const blockLines = String(rendered).replace(/^\n+/, '').replace(/\n+$/, '').split('\n');
+    if (blockLines.length === 1 && blockLines[0] === '') return [];
+    return blockLines;
+  };
+
+  // Compute a source-line number (or null = blank gutter) for each visual line
+  // of a rendered block. Strategy per type:
+  //  - code:  each rendered line maps 1:1 to a source code line, so number every
+  //           one (offset past the opening fence when present). Any extra lines
+  //           beyond the source count (e.g. soft-wrapped) get null.
+  //  - other: number the first visual line with the block's start line; the rest
+  //           are wrap/reflow continuations and stay blank. (Lists are handled
+  //           separately, per item, in the loop below.)
+  const numbersForBlock = (tok, startLine, blockLines) => {
+    if (tok.type === 'code') {
+      const fenced = /^\s*(```|~~~)/.test(tok.raw);
+      const firstContent = startLine + (fenced ? 1 : 0);
+      const contentCount = countNewlines(tok.text) + 1; // code lines in source
+      return blockLines.map((_, i) => (i < contentCount ? firstContent + i : null));
+    }
+    return blockLines.map((_, i) => (i === 0 ? startLine : null));
+  };
+
+  // Push a block's lines into the output with their gutter numbers.
+  const pushBlock = (blockLines, numbers) => {
+    blockLines.forEach((line, i) => {
+      const n = numbers[i];
+      outLines.push((n == null ? gutterBlank : makeGutter(n)) + line);
+    });
+  };
+
   const outLines = [];
   let srcLine = 1;
   for (const token of tokens) {
     const startLine = srcLine;
     // Advance the source-line counter by the newlines this token spans.
-    srcLine += (token.raw.match(/\n/g) || []).length;
+    srcLine += countNewlines(token.raw);
 
     if (token.type === 'space') continue; // blank lines produce no output
+
+    if (token.type === 'list') {
+      // Lists are numbered per item: render each item as its own single-item
+      // list so we can tag the item's first visual line with its source line.
+      // Nested content and wrapped lines within an item stay blank.
+      let itemLine = startLine;
+      token.items.forEach((item, idx) => {
+        const subList = { ...token, items: [item], raw: item.raw };
+        if (token.ordered) {
+          const start = Number(token.start);
+          subList.start = (Number.isFinite(start) ? start : 1) + idx;
+        }
+        const itemLines = renderBlockLines(subList);
+        if (itemLines.length) {
+          pushBlock(itemLines, itemLines.map((_, i) => (i === 0 ? itemLine : null)));
+        }
+        itemLine += countNewlines(item.raw);
+      });
+      outLines.push('');
+      continue;
+    }
 
     // Render this block through the full pipeline (marked-terminal styling +
     // our overrides) by re-parsing its raw source. Per-block rendering is what
     // lets us attach the correct source line number to each block's output.
-    const rendered = marked.parse(token.raw, { async: false });
-    // Strip leading/trailing blank lines so the block's line number lands on
-    // its first real line (headings etc. emit a leading newline).
-    const blockLines = String(rendered).replace(/^\n+/, '').replace(/\n+$/, '').split('\n');
-    if (blockLines.length === 1 && blockLines[0] === '') continue;
+    const blockLines = renderBlockLines(token);
+    if (!blockLines.length) continue;
 
-    // Number only the FIRST visual line of the block; continuation/wrapped
-    // lines get a blank gutter of the same width.
-    blockLines.forEach((line, i) => {
-      outLines.push((i === 0 ? makeGutter(startLine) : gutterBlank) + line);
-    });
+    pushBlock(blockLines, numbersForBlock(token, startLine, blockLines));
     outLines.push(''); // blank separator line (with no gutter) between blocks
   }
 

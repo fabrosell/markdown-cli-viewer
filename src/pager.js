@@ -90,9 +90,24 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     if (top < 0) top = 0;
   }
 
+  // Compute the scrollbar thumb's [start, end) row range within a viewport of
+  // `h` rows showing `total` lines from offset `top`. Returns null when all
+  // content fits (no scrollbar needed).
+  function thumbRange(total, h, topIdx) {
+    if (total <= h) return null;
+    const size = Math.max(1, Math.round((h * h) / total));
+    const maxStart = h - size;
+    const scrollable = total - h;
+    let start = Math.round((topIdx / scrollable) * maxStart);
+    if (topIdx >= scrollable) start = maxStart; // pin to bottom at END
+    if (start < 0) start = 0;
+    return { start, end: start + size };
+  }
+
   function draw() {
     const h = viewHeight();
     clampTop();
+    const col = out.columns || 80;
     const slice = lines.slice(top, top + h);
     // Move home, clear screen, draw.
     let buf = '\x1b[H\x1b[2J';
@@ -101,12 +116,25 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     const pad = h - slice.length;
     if (pad > 0) buf += '\n'.repeat(pad);
 
-    // Status line (inverse video).
+    // Vertical scrollbar: overlay a single column on the far right using absolute
+    // cursor addressing, so it sits atop the content without needing per-line
+    // width math (content rarely reaches the last column). '█' = thumb, '░' =
+    // track. Hidden entirely when everything fits.
+    const thumb = thumbRange(lines.length, h, top);
+    if (thumb) {
+      for (let r = 0; r < h; r++) {
+        const ch = r >= thumb.start && r < thumb.end ? '█' : '░';
+        const cell = color ? `\x1b[90m${ch}\x1b[0m` : ch;
+        buf += `\x1b[${r + 1};${col}H${cell}`;
+      }
+    }
+
+    // Status line (inverse video), placed absolutely on the row below content.
     const atBottom = top >= Math.max(0, lines.length - h);
     const pct = lines.length <= h ? 'ALL' : atBottom ? 'END' : `${Math.round((top / Math.max(1, lines.length - h)) * 100)}%`;
     const mode = watch ? ' [auto-reload] ' : ' ';
     const status = ` ${file}${mode}${pct}  (q quit  ↑↓/jk scroll  space/b page  g/G top/bottom) `;
-    buf += `\n\x1b[7m${status.slice(0, out.columns || 80)}\x1b[0m`;
+    buf += `\x1b[${h + 1};1H\x1b[7m${status.slice(0, col)}\x1b[0m`;
     out.write(buf);
   }
 
@@ -116,8 +144,11 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
   // the parseable `ESC[<btn;x;y;M` form. We enable both so wheel events reach us
   // as data instead of the terminal translating a notch into a single arrow key
   // (which is what made scrolling crawl one line at a time).
-  const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
-  const MOUSE_OFF = '\x1b[?1000l\x1b[?1006l';
+  // 1002 = button-event tracking: reports button press, release, AND motion
+  // while a button is held (needed for click-and-drag on the scrollbar). 1006 =
+  // SGR encoding so reports arrive as the parseable `ESC[<btn;x;y;M/m` form.
+  const MOUSE_ON = '\x1b[?1002h\x1b[?1006h';
+  const MOUSE_OFF = '\x1b[?1002l\x1b[?1006l';
   const WHEEL_LINES = 5; // lines moved per wheel notch
   const ENTER = '\x1b[?1049h\x1b[?25l' + MOUSE_ON; // alt screen + hide cursor + mouse
   const LEAVE = MOUSE_OFF + '\x1b[0m\x1b[?25h\x1b[?1049l'; // mouse off, reset style, show cursor, leave alt screen
@@ -209,12 +240,34 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     draw();
   });
 
-  // Mouse wheel: parse SGR mouse reports (ESC[<btn;x;y;M). Button 64 = wheel up,
-  // 65 = wheel down; each notch moves WHEEL_LINES lines. We read these from the
-  // raw data stream rather than keypress because readline doesn't surface mouse
-  // reports as key events. A single data chunk can carry several notches, so we
-  // scan them all and redraw once.
-  const MOUSE_SGR = /\x1b\[<(\d+);\d+;\d+[Mm]/g;
+  // Move `top` so the scrollbar thumb lands at viewport row `y` (1-based). Used
+  // for click and drag on the scrollbar. Returns true if it could move.
+  function setTopFromRow(y) {
+    const h = viewHeight();
+    const total = lines.length;
+    const scrollable = total - h;
+    if (scrollable <= 0) return false;
+    const size = Math.max(1, Math.round((h * h) / total));
+    const maxStart = Math.max(1, h - size);
+    let r = y - 1;
+    if (r < 0) r = 0;
+    if (r > maxStart) r = maxStart;
+    top = Math.round((r / maxStart) * scrollable);
+    clampTop();
+    return true;
+  }
+
+  // Mouse: parse SGR reports (ESC[<btn;x;y;M press / m release). We read these
+  // from the raw data stream rather than keypress because readline doesn't
+  // surface mouse reports as key events. A single chunk can carry several events,
+  // so we scan them all and redraw once.
+  //   btn 64/65         = wheel up/down -> scroll WHEEL_LINES lines.
+  //   btn 0 (+32 motion) = left button press / drag -> grab the scrollbar.
+  // Dragging latches on press over the scrollbar column; once grabbed, further
+  // motion keeps steering it even if the pointer drifts off that column, until
+  // release.
+  const MOUSE_SGR = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+  let scrollDragging = false;
   process.stdin.on('data', (data) => {
     const s = data.toString('latin1');
     if (s.indexOf('\x1b[<') === -1) return; // not a mouse report
@@ -223,8 +276,27 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     MOUSE_SGR.lastIndex = 0;
     while ((m = MOUSE_SGR.exec(s)) !== null) {
       const btn = parseInt(m[1], 10);
-      if (btn === 64) { top -= WHEEL_LINES; moved = true; }       // wheel up
-      else if (btn === 65) { top += WHEEL_LINES; moved = true; }  // wheel down
+      const x = parseInt(m[2], 10);
+      const y = parseInt(m[3], 10);
+      const release = m[4] === 'm';
+      if (btn === 64) { top -= WHEEL_LINES; moved = true; continue; }       // wheel up
+      if (btn === 65) { top += WHEEL_LINES; moved = true; continue; }       // wheel down
+
+      const base = btn & ~32;      // strip the "motion" bit
+      const isMotion = (btn & 32) !== 0;
+      if (base !== 0) continue;    // only the left button drives the scrollbar
+
+      if (release) { scrollDragging = false; continue; }
+
+      const col = out.columns || 80;
+      const onBar = x >= col;      // scrollbar lives in the last column
+      if (!isMotion) {
+        // Fresh left press: grab only if it landed on the scrollbar.
+        if (onBar && setTopFromRow(y)) { scrollDragging = true; moved = true; }
+      } else if (scrollDragging) {
+        // Drag in progress: keep steering regardless of column.
+        if (setTopFromRow(y)) moved = true;
+      }
     }
     if (moved) draw();
   });
