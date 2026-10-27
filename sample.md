@@ -48,6 +48,15 @@ You can use **bold**, *italic*, ***bold italic***, ~~strikethrough~~, and
   | November | 73 |
   | December | 68 |
 
+## Colons in inline code
+
+These exercise the placeholder-restore pass. Each inline code span below contains
+colons, which must render as real `:` characters (not the `*#COLON|*` sentinel):
+
+- A `file:line` citation like `renderer.js:42` should keep its colon.
+- A URL in code: `https://example.com:8080/path` keeps both colons.
+- A time range `09:00–17:30` and a ratio `3:1` inside `08:15:00` all survive.
+
 ## Code block
 
 ```js

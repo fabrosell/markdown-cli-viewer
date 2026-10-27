@@ -111,8 +111,16 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
   }
 
   // Terminal control sequences.
-  const ENTER = '\x1b[?1049h\x1b[?25l'; // alt screen + hide cursor
-  const LEAVE = '\x1b[0m\x1b[?25h\x1b[?1049l'; // reset style, show cursor, leave alt screen
+  // Mouse reporting: X11 button tracking (1000) reports wheel notches as button
+  // presses (64 = up, 65 = down); SGR mode (1006) makes those reports arrive as
+  // the parseable `ESC[<btn;x;y;M` form. We enable both so wheel events reach us
+  // as data instead of the terminal translating a notch into a single arrow key
+  // (which is what made scrolling crawl one line at a time).
+  const MOUSE_ON = '\x1b[?1000h\x1b[?1006h';
+  const MOUSE_OFF = '\x1b[?1000l\x1b[?1006l';
+  const WHEEL_LINES = 5; // lines moved per wheel notch
+  const ENTER = '\x1b[?1049h\x1b[?25l' + MOUSE_ON; // alt screen + hide cursor + mouse
+  const LEAVE = MOUSE_OFF + '\x1b[0m\x1b[?25h\x1b[?1049l'; // mouse off, reset style, show cursor, leave alt screen
 
   // --- input handling ---
   readline.emitKeypressEvents(process.stdin);
@@ -136,6 +144,7 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     cleanedUp = true;
     if (watcher) watcher.close();
     process.stdin.removeAllListeners('keypress');
+    process.stdin.removeAllListeners('data');
     if (wasRaw && process.stdin.isTTY) {
       try { process.stdin.setRawMode(false); } catch {}
     }
@@ -198,6 +207,26 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
         else return;
     }
     draw();
+  });
+
+  // Mouse wheel: parse SGR mouse reports (ESC[<btn;x;y;M). Button 64 = wheel up,
+  // 65 = wheel down; each notch moves WHEEL_LINES lines. We read these from the
+  // raw data stream rather than keypress because readline doesn't surface mouse
+  // reports as key events. A single data chunk can carry several notches, so we
+  // scan them all and redraw once.
+  const MOUSE_SGR = /\x1b\[<(\d+);\d+;\d+[Mm]/g;
+  process.stdin.on('data', (data) => {
+    const s = data.toString('latin1');
+    if (s.indexOf('\x1b[<') === -1) return; // not a mouse report
+    let m;
+    let moved = false;
+    MOUSE_SGR.lastIndex = 0;
+    while ((m = MOUSE_SGR.exec(s)) !== null) {
+      const btn = parseInt(m[1], 10);
+      if (btn === 64) { top -= WHEEL_LINES; moved = true; }       // wheel up
+      else if (btn === 65) { top += WHEEL_LINES; moved = true; }  // wheel down
+    }
+    if (moved) draw();
   });
 
   out.on('resize', () => {

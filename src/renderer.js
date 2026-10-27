@@ -14,6 +14,28 @@ import { Chalk } from 'chalk';
 const ANSI_RE = /\[[0-9;]*m/g;
 const displayWidth = (s) => s.replace(ANSI_RE, '').length;
 
+// marked-terminal protects certain characters with internal sentinel tokens
+// while it renders (e.g. it swaps ':' for *#COLON|* inside codespans so the
+// emoji parser can't mistake `file:line` for a `:emoji:` shortcode). Those
+// sentinels are normally undone by marked-terminal's own final transform, but
+// our custom block renderers (paragraph/list/table) build output directly and
+// bypass that step, so the raw tokens leak into the view. Restore them here as a
+// final pass over the fully-rendered string. ANSI escape codes never contain
+// these literals, so this is safe to run over styled output.
+// Values mirror marked-terminal's constants (node_modules/marked-terminal/index.js).
+const MT_PLACEHOLDERS = [
+  ['*#COLON|*', ':'], // COLON_REPLACER -> literal colon
+  ['^*||*^', ''],     // TABLE_CELL_SPLIT (orphaned outside our own table path)
+  ['*|*|*|*', ''],    // TABLE_ROW_WRAP  (orphaned outside our own table path)
+];
+function restorePlaceholders(s) {
+  let out = s;
+  for (const [token, replacement] of MT_PLACEHOLDERS) {
+    out = out.split(token).join(replacement);
+  }
+  return out;
+}
+
 // Full-justify a single visual line to `width` by distributing extra spaces
 // evenly into the gaps between words. ANSI codes are preserved (they attach to
 // their adjacent word and don't count toward width). Lines with a single word,
@@ -112,7 +134,7 @@ function renderTable(token, inline, width, color, c) {
   const aligns = token.align.map((a) => alignMap[a] || 'left');
 
   const head = token.header.map((cell) =>
-    c.bold(wrapText(inline(cell.tokens), maxColWidth))
+    c.bold(wrapText(restorePlaceholders(inline(cell.tokens)), maxColWidth))
   );
 
   const table = new Table({
@@ -128,7 +150,7 @@ function renderTable(token, inline, width, color, c) {
   });
 
   for (const row of token.rows) {
-    table.push(row.map((cell) => wrapText(inline(cell.tokens), maxColWidth)));
+    table.push(row.map((cell) => wrapText(restorePlaceholders(inline(cell.tokens)), maxColWidth)));
   }
 
   return '\n' + table.toString() + '\n\n';
@@ -191,7 +213,7 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
     renderer: {
       heading(token) {
         // Clean heading: colored + bold, no literal '#' markers. h1 underlined.
-        const text = this.parser.parseInline(token.tokens);
+        const text = restorePlaceholders(this.parser.parseInline(token.tokens));
         const styled =
           token.depth === 1 ? c.magenta.bold.underline(text) : c.cyan.bold(text);
         return '\n' + styled + '\n\n';
@@ -201,7 +223,7 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
         // quotes (the bar/indent would otherwise push justified lines past the
         // margin), so the body stays ragged-right within the quote.
         quoteDepth++;
-        const inner = this.parser.parse(token.tokens, true).replace(/\n+$/, '');
+        const inner = restorePlaceholders(this.parser.parse(token.tokens, true)).replace(/\n+$/, '');
         quoteDepth--;
         const bar = color ? c.gray('│ ') : '│ ';
         const lines = inner.split('\n').map((l) => bar + (color ? c.gray.italic(l) : l));
@@ -213,7 +235,7 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
         // the source (a paragraph hard-wrapped in the .md file) become spaces so
         // the whole paragraph reflows as one stream instead of per-source-line.
         // Inside a blockquote we skip justification and reserve room for the bar.
-        const text = this.parser.parseInline(token.tokens).replace(/\s*\n\s*/g, ' ');
+        const text = restorePlaceholders(this.parser.parseInline(token.tokens)).replace(/\s*\n\s*/g, ' ');
         const w = quoteDepth > 0 ? Math.max(8, contentWidth - 2 * quoteDepth) : contentWidth;
         const wrapped = wrapText(text, w);
         if (quoteDepth > 0) return wrapped + '\n\n';
@@ -255,7 +277,7 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
 
           // Continuation lines carry the widest prefix (`pad` = indent + 2), so
           // wrap to that constraint to keep every line within the viewport.
-          const wrapped = wrapText(inlineStr.trim(), Math.max(8, effectiveWidth - pad.length));
+          const wrapped = wrapText(restorePlaceholders(inlineStr.trim()), Math.max(8, effectiveWidth - pad.length));
           const [first = '', ...rest] = wrapped.split('\n');
           lines.push(`  ${marker} ${first}`);
           for (const r of rest) lines.push(pad + r);
@@ -312,7 +334,7 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
 
   // Trim a trailing blank separator and collapse any 3+ blank runs.
   while (outLines.length && outLines[outLines.length - 1] === '') outLines.pop();
-  return outLines.join('\n').replace(/\n{3,}/g, '\n\n');
+  return restorePlaceholders(outLines.join('\n').replace(/\n{3,}/g, '\n\n'));
 }
 
 export { wrapText };
