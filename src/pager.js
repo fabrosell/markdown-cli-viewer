@@ -59,6 +59,104 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
   let lines = [];
   let top = 0; // index of first visible rendered line
 
+  // --- search state ---
+  let query = '';        // active search term ('' = no search)
+  let matches = [];      // [{ line, start, length }] in each line's VISIBLE (ANSI-stripped) coords
+  let matchIdx = -1;     // index into matches of the current/focused match
+  let searchMode = false;// true while the user is typing a query
+  let searchInput = '';  // buffer shown in the prompt while typing
+  let searchMsg = '';    // transient message (e.g. "No matches")
+
+  // Find every occurrence of `query` (case-insensitive) across all lines, in
+  // visible coordinates (ANSI stripped, gutter included) so offsets line up with
+  // what highlightLine walks. Offsets include the gutter — searching plain words
+  // is unaffected; only digit searches might incidentally hit a line number.
+  function computeMatches() {
+    matches = [];
+    if (!query) { matchIdx = -1; return; }
+    const needle = query.toLowerCase();
+    for (let li = 0; li < lines.length; li++) {
+      const vis = strip(lines[li]);
+      const hay = vis.toLowerCase();
+      let from = 0;
+      let at;
+      while ((at = hay.indexOf(needle, from)) !== -1) {
+        matches.push({ line: li, start: at, length: query.length });
+        from = at + Math.max(1, query.length);
+      }
+    }
+  }
+
+  // Scroll so the match at `matches[idx]` is comfortably in view, then focus it.
+  function gotoMatch(idx) {
+    if (!matches.length) return;
+    matchIdx = ((idx % matches.length) + matches.length) % matches.length;
+    const ln = matches[matchIdx].line;
+    const h = viewHeight();
+    if (ln < top || ln >= top + h) {
+      top = Math.max(0, ln - Math.floor(h / 3));
+    }
+    clampTop();
+  }
+
+  // Run a fresh search for `q`: compute matches and jump to the first one at or
+  // after the current viewport top (wrapping to the first overall otherwise).
+  function runSearch(q) {
+    query = q;
+    computeMatches();
+    searchMsg = '';
+    if (!matches.length) {
+      matchIdx = -1;
+      searchMsg = `No matches for "${q}"  (Esc to close)`;
+      return;
+    }
+    let idx = matches.findIndex((m) => m.line >= top);
+    if (idx === -1) idx = 0;
+    gotoMatch(idx);
+  }
+
+  // Wrap `line`'s match ranges in highlight attributes. Uses reverse-video
+  // (SGR 7/27) so only the inverse bit toggles — surrounding color/bold from the
+  // syntax styling survive untouched. The focused match adds bold (1/22) on top.
+  function highlightLine(line, lineIdx) {
+    if (!query) return line;
+    const lm = matches.filter((m) => m.line === lineIdx);
+    if (!lm.length) return line;
+    lm.sort((a, b) => a.start - b.start);
+
+    let out = '';
+    let vis = 0;      // visible column walked so far
+    let i = 0;        // byte index into the (ANSI-bearing) line
+    let mi = 0;       // next match to open
+    let open = null;  // currently open match or null
+    let curEnd = -1;
+    while (i < line.length) {
+      if (line[i] === '\x1b') {
+        const esc = line.slice(i).match(/^\x1b\[[0-9;]*m/);
+        if (esc) { out += esc[0]; i += esc[0].length; continue; }
+      }
+      if (open && vis === curEnd) { out += open.post; open = null; }
+      if (!open && mi < lm.length && vis === lm[mi].start) {
+        const focused = matches[matchIdx] && matches[matchIdx].line === lineIdx && matches[matchIdx].start === lm[mi].start;
+        // Non-focused matches: reverse-video (toggles only the inverse bit via
+        // SGR 7/27, so surrounding syntax color/bold survive). The focused match
+        // gets a distinct, high-contrast look — bold black text on a yellow
+        // background — so it's unmistakable among several hits on one screen.
+        open = focused
+          ? { pre: '\x1b[1m\x1b[30m\x1b[43m', post: '\x1b[22m\x1b[39m\x1b[49m' }
+          : { pre: '\x1b[7m', post: '\x1b[27m' };
+        curEnd = lm[mi].start + lm[mi].length;
+        out += open.pre;
+        mi++;
+      }
+      out += line[i];
+      i++;
+      vis++;
+    }
+    if (open) out += open.post; // match ran to end of line
+    return out;
+  }
+
   function rebuild(preservePos) {
     let anchorText = null;
     let anchorHint = top;
@@ -77,6 +175,7 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     }
     const rendered = render(md, { width: getWidth(), color, lineNumbers });
     lines = rendered.split('\n');
+    if (query) computeMatches(); // keep highlights/counts valid across re-render
 
     if (preservePos) {
       top = findAnchor(lines, anchorText, anchorHint);
@@ -109,9 +208,9 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     clampTop();
     const col = out.columns || 80;
     const slice = lines.slice(top, top + h);
-    // Move home, clear screen, draw.
+    // Move home, clear screen, draw (highlighting search matches in view).
     let buf = '\x1b[H\x1b[2J';
-    buf += slice.join('\n');
+    buf += slice.map((line, i) => highlightLine(line, top + i)).join('\n');
     // Pad remaining rows so stale content is cleared.
     const pad = h - slice.length;
     if (pad > 0) buf += '\n'.repeat(pad);
@@ -130,10 +229,21 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     }
 
     // Status line (inverse video), placed absolutely on the row below content.
-    const atBottom = top >= Math.max(0, lines.length - h);
-    const pct = lines.length <= h ? 'ALL' : atBottom ? 'END' : `${Math.round((top / Math.max(1, lines.length - h)) * 100)}%`;
-    const mode = watch ? ' [auto-reload] ' : ' ';
-    const status = ` ${file}${mode}${pct}  (q quit  ↑↓/jk scroll  space/b page  g/G top/bottom) `;
+    let status;
+    if (searchMode) {
+      // Live search prompt while typing.
+      status = ` /${searchInput}_ `;
+    } else if (query) {
+      // Active search: show the term and current/total count.
+      const count = matches.length ? `${matchIdx + 1}/${matches.length}` : '0/0';
+      const hint = searchMsg || `(n/F3 next  N prev  Esc clear)`;
+      status = ` /${query}  [${count}]  ${hint} `;
+    } else {
+      const atBottom = top >= Math.max(0, lines.length - h);
+      const pct = lines.length <= h ? 'ALL' : atBottom ? 'END' : `${Math.round((top / Math.max(1, lines.length - h)) * 100)}%`;
+      const mode = watch ? ' [auto-reload] ' : ' ';
+      status = ` ${file}${mode}${pct}  (q quit  ↑↓/jk scroll  space/b page  g/G top/bottom  /^f find) `;
+    }
     buf += `\x1b[${h + 1};1H\x1b[7m${status.slice(0, col)}\x1b[0m`;
     out.write(buf);
   }
@@ -205,10 +315,56 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
 
   const h = () => viewHeight();
 
+  const nextMatch = () => { if (matches.length) { gotoMatch(matchIdx + 1); draw(); } };
+  const prevMatch = () => { if (matches.length) { gotoMatch(matchIdx - 1); draw(); } };
+
   process.stdin.on('keypress', (str, key) => {
     if (!key) return;
     const name = key.name;
     if (key.ctrl && name === 'c') return quit(0);
+
+    // --- search input mode: capture typing until Enter/Esc ---
+    if (searchMode) {
+      if (name === 'return' || name === 'enter') {
+        searchMode = false;
+        const q = searchInput;
+        searchInput = '';
+        if (q) runSearch(q);
+        else { query = ''; matches = []; matchIdx = -1; }
+        return draw();
+      }
+      if (name === 'escape') {
+        searchMode = false;
+        searchInput = '';
+        return draw();
+      }
+      if (name === 'backspace') {
+        searchInput = searchInput.slice(0, -1);
+        return draw();
+      }
+      // Append any single printable character.
+      if (str && str.length === 1 && str >= ' ' && !key.ctrl && !key.meta) {
+        searchInput += str;
+        return draw();
+      }
+      return; // ignore other keys while typing
+    }
+
+    // Open search: Ctrl+F (when no active search) or '/'.
+    if ((key.ctrl && name === 'f') || str === '/') {
+      if (key.ctrl && name === 'f' && query) return nextMatch(); // Ctrl+F repeats = next
+      searchMode = true;
+      searchInput = '';
+      searchMsg = '';
+      return draw();
+    }
+
+    // Search navigation (only meaningful with an active query).
+    if (name === 'f3') return key.shift ? prevMatch() : nextMatch();
+    if (query && (str === 'n' || (name === 'n' && !key.shift))) return nextMatch();
+    if (query && (str === 'N' || (name === 'n' && key.shift))) return prevMatch();
+    if (query && name === 'escape') { query = ''; matches = []; matchIdx = -1; return draw(); }
+
     switch (name) {
       case 'q':
         return quit(0);
