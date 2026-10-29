@@ -133,8 +133,11 @@ function renderTable(token, inline, width, color, c) {
 
   const aligns = token.align.map((a) => alignMap[a] || 'left');
 
+  // Header cells are bold; carry a color too (bold weight alone is invisible on
+  // Windows Terminal — same reason `strong` is colored). Green matches the inline
+  // bold style so a table reads consistently.
   const head = token.header.map((cell) =>
-    c.bold(wrapText(restorePlaceholders(inline(cell.tokens)), maxColWidth))
+    (color ? c.green.bold : c.bold)(wrapText(restorePlaceholders(inline(cell.tokens)), maxColWidth))
   );
 
   const table = new Table({
@@ -194,7 +197,11 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
         blockquote: c.gray.italic,
         html: c.gray,
         hr: c.gray,
-        strong: c.bold,
+        // Windows Terminal (and many others) ignore the bold *weight*, so plain
+        // SGR-1 bold is invisible. Carry a color too (green — distinct from the
+        // magenta/cyan headings, yellow code, and blue links) so `**bold**` is
+        // actually distinguishable, including inside table cells.
+        strong: c.green.bold,
         em: c.italic,
         del: c.strikethrough,
         link: c.blue.underline,
@@ -244,6 +251,16 @@ export function render(markdown, { width = 80, color = true, lineNumbers = true 
       table(token) {
         const inline = (tokens) => this.parser.parseInline(tokens);
         return renderTable(token, inline, contentWidth, color, c);
+      },
+      link(token) {
+        // marked-terminal styles both `link` and `href` with the same
+        // blue+underline, and the nested result emits an unbalanced underline
+        // sequence (an extra SGR 4 with no matching 24) that leaves underline
+        // stuck "on" — it then bleeds down the page (and, in the pager, across
+        // frames) until the next close code. Render the link ourselves so each
+        // link is a single, balanced blue+underline span.
+        const label = restorePlaceholders(this.parser.parseInline(token.tokens));
+        return color ? c.blue.underline(label) : label;
       },
       list(token) {
         const ordered = token.ordered;

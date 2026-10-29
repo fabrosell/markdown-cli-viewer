@@ -209,7 +209,10 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     const col = out.columns || 80;
     const slice = lines.slice(top, top + h);
     // Move home, clear screen, draw (highlighting search matches in view).
-    let buf = '\x1b[H\x1b[2J';
+    // Reset SGR first: clearing the screen does NOT reset text attributes, so an
+    // unbalanced style on the previous frame's last line (e.g. a stray underline)
+    // would otherwise bleed into the top of this frame.
+    let buf = '\x1b[0m\x1b[H\x1b[2J';
     buf += slice.map((line, i) => highlightLine(line, top + i)).join('\n');
     // Pad remaining rows so stale content is cleared.
     const pad = h - slice.length;
