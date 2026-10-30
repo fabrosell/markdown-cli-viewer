@@ -25,6 +25,10 @@ const strip = (s) => s.replace(ANSI, '');
 const stripGutter = (s) => s.replace(/^\s*\d+\s*│ /, '').replace(/^\s*│ /, '');
 const norm = (s) => stripGutter(strip(s)).trim().replace(/\s+/g, ' ');
 
+// Blank lines appended after the rendered content so the last document line can
+// scroll past the status bar with breathing room rather than touching it.
+const BOTTOM_PADDING = 3;
+
 function readFileSafe(file) {
   return fs.readFileSync(file, 'utf8');
 }
@@ -175,6 +179,9 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     }
     const rendered = render(md, { width: getWidth(), color, lineNumbers });
     lines = rendered.split('\n');
+    // Append a few blank lines so the document's last line can scroll clear of
+    // the status bar instead of sitting flush against it at END.
+    for (let i = 0; i < BOTTOM_PADDING; i++) lines.push('');
     if (query) computeMatches(); // keep highlights/counts valid across re-render
 
     if (preservePos) {
@@ -245,7 +252,7 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
       const atBottom = top >= Math.max(0, lines.length - h);
       const pct = lines.length <= h ? 'ALL' : atBottom ? 'END' : `${Math.round((top / Math.max(1, lines.length - h)) * 100)}%`;
       const mode = watch ? ' [auto-reload] ' : ' ';
-      status = ` ${file}${mode}${pct}  (q quit  ↑↓/jk scroll  space/b page  g/G top/bottom  /^f find) `;
+      status = ` ${file}${mode}${pct}  (q quit  ↑↓/jk scroll  space/b page  g/G top/bottom  /^f find  r reload) `;
     }
     buf += `\x1b[${h + 1};1H\x1b[7m${status.slice(0, col)}\x1b[0m`;
     out.write(buf);
@@ -367,6 +374,12 @@ export function startPager(file, { color = true, watch = false, width, lineNumbe
     if (query && (str === 'n' || (name === 'n' && !key.shift))) return nextMatch();
     if (query && (str === 'N' || (name === 'n' && key.shift))) return prevMatch();
     if (query && name === 'escape') { query = ''; matches = []; matchIdx = -1; return draw(); }
+
+    // Manual reload: re-read and re-render the file, keeping the scroll position.
+    if (str === 'r' || (name === 'r' && !key.ctrl && !key.meta)) {
+      rebuild(true);
+      return draw();
+    }
 
     switch (name) {
       case 'q':
